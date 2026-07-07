@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -70197,8 +70196,54 @@ function getRenderer(){
   _renderer.outputColorSpace=THREE.SRGBColorSpace;
   return _renderer;
 }
-const fbxLoader=new FBXLoader();
+/* [FIX] FBX の埋め込みテクスチャは parse() 復帰後も非同期で読み込みが続く。
+   従来は待たずに即エクスポート/ポスター描画していたため、テクスチャ付き FBX で
+   「テクスチャ無し/真っ黒」など不安定な結果になることがあった(競合状態)。
+   専用 LoadingManager で読み込み完了を待つ。 */
+const fbxManager=new THREE.LoadingManager();
+let _fbxLoadStarted=false;
+fbxManager.onStart=()=>{_fbxLoadStarted=true;};
+fbxManager.onError=(url)=>{console.warn('[FBX] テクスチャ読込失敗(外部参照ファイルはブラウザから読めません):',url);};
+function waitFbxTextures(timeoutMs){
+  if(!_fbxLoadStarted) return Promise.resolve();          // テクスチャ等の非同期読込が無ければ即続行
+  return new Promise(res=>{
+    let done=false; const fin=()=>{ if(!done){done=true; res();} };
+    fbxManager.onLoad=fin;
+    setTimeout(fin, timeoutMs||8000);                     // 読めない外部テクスチャがあっても先へ進む
+  });
+}
+const fbxLoader=new FBXLoader(fbxManager);
 const gltfLoader=new GLTFLoader();
+/* [FIX] KHR_materials_pbrSpecularGlossiness フォールバック。
+   Microsoft GLTF Exporter(Paint 3D / 3Dビューアー / Office の FBX→GLB 変換)製の GLB は、
+   色情報を本拡張の diffuseFactor/diffuseTexture にのみ持ち、pbrMetallicRoughness は空。
+   three.js r150 以降の GLTFLoader は本拡張のサポートが削除されており、そのまま読むと
+   baseColor が既定の白(1,1,1)になる = 「色が無くなって真っ白」現象の原因。
+   diffuse→baseColor / glossiness→(1-roughness) に変換して MeshStandardMaterial を生成する。 */
+class GLTFSpecGlossFallback {
+  constructor(parser){ this.parser=parser; this.name='KHR_materials_pbrSpecularGlossiness'; }
+  getMaterialType(index){
+    const md=this.parser.json.materials[index];
+    return (md && md.extensions && md.extensions[this.name]) ? THREE.MeshStandardMaterial : null;
+  }
+  extendMaterialParams(index, params){
+    const md=this.parser.json.materials[index];
+    const ext=md && md.extensions && md.extensions[this.name];
+    if(!ext) return Promise.resolve();
+    const pending=[];
+    if(Array.isArray(ext.diffuseFactor)){
+      const d=ext.diffuseFactor;
+      params.color=new THREE.Color().setRGB(d[0],d[1],d[2],THREE.LinearSRGBColorSpace);
+      params.opacity=d[3];
+      if(d[3]<1) params.transparent=true;
+    }
+    if(ext.diffuseTexture) pending.push(this.parser.assignTexture(params,'map',ext.diffuseTexture,THREE.SRGBColorSpace));
+    params.metalness=0;
+    params.roughness=(typeof ext.glossinessFactor==='number')?(1-ext.glossinessFactor):1;
+    return Promise.all(pending);
+  }
+}
+gltfLoader.register(p=>new GLTFSpecGlossFallback(p));
 const gltfExporter=new GLTFExporter();
 
 // [FIX] アニメーション全フレームでのスキン変形後の頂点境界を求める。
@@ -70213,6 +70258,9 @@ const gltfExporter=new GLTFExporter();
    再構築し、この複製膨張を解消する。indexed / non-indexed 両対応。スキニング・アニメ維持。 */
 function optimizeMesh(mesh){
   const geo=mesh.geometry, index=geo.index;
+  // [FIX] ブレンドシェイプ(morphAttributes)は再構築処理で複製していないため、
+  //       対象メッシュは最適化をスキップして形状破壊を防ぐ。
+  if(geo.morphAttributes && Object.keys(geo.morphAttributes).length>0) return null;
   const matArr=Array.isArray(mesh.material)?mesh.material:[mesh.material];
   const vcount=geo.attributes.position.count;
   const groups=(geo.groups&&geo.groups.length)?geo.groups:[{start:0,count:index?index.count:vcount,materialIndex:0}];
@@ -70255,7 +70303,16 @@ function optimizeMeshes(root){
     before+=mesh.geometry.attributes.position.count;
     const parent=mesh.parent; if(!parent){ after+=mesh.geometry.attributes.position.count; continue; }
     const parts=optimizeMesh(mesh);
-    if(parts){ parent.remove(mesh); for(const p of parts){ parent.add(p); after+=p.geometry.attributes.position.count; } changed++; }
+    if(parts){
+      // [FIX] FBX ではメッシュの下に子ノード(ボーン/別メッシュ/ロケータ等)がぶら下がる
+      //       ことがある。従来は parent.remove(mesh) で子ごと破棄され、モデルの一部や
+      //       スケルトンが消える原因になっていた。子は同一トランスフォームの先頭パーツへ移す。
+      const kids=[...mesh.children];
+      parent.remove(mesh);
+      for(const p of parts){ parent.add(p); after+=p.geometry.attributes.position.count; }
+      for(const k of kids) parts[0].add(k);
+      changed++;
+    }
     else after+=mesh.geometry.attributes.position.count;
   }
   return {changed, before, after};
@@ -70263,6 +70320,13 @@ function optimizeMeshes(root){
 function computeAnimatedBounds(obj, clip, samples){
   samples=samples||20;
   const box=new THREE.Box3(), v=new THREE.Vector3();
+  // [FIX] AnimationMixer はボーンだけでなく通常ノードの TRS も書き換える。
+  //       従来は skeleton.pose()(ボーンのみ)しか復元しておらず、剛体アニメ
+  //       (ノードの移動/回転トラック)を持つ FBX では最終サンプルフレームの姿勢が
+  //       レスト姿勢として GLB に書き出され、静止表示がずれる原因になっていた。
+  //       全ノードの TRS を保存し、サンプリング後に完全復元する。
+  const saved=[];
+  obj.traverse(o=>saved.push([o,o.position.clone(),o.quaternion.clone(),o.scale.clone()]));
   const mixer=new THREE.AnimationMixer(obj);
   const action=mixer.clipAction(clip); action.play();
   for(let k=0;k<=samples;k++){
@@ -70277,8 +70341,9 @@ function computeAnimatedBounds(obj, clip, samples){
       }
     });
   }
-  obj.traverse(o=>{ if(o.isSkinnedMesh&&o.skeleton) o.skeleton.pose(); }); // バインドポーズに戻す(以後の export 用)
   mixer.stopAllAction();
+  for(const [o,p,q,s] of saved){ o.position.copy(p); o.quaternion.copy(q); o.scale.copy(s); } // [FIX] 元のTRSへ完全復元
+  obj.updateMatrixWorld(true);
   return box;
 }
 function normalizeObject(obj, animations){
@@ -70353,6 +70418,10 @@ function sanitizeGlbAnimations(u8){
       return true;
     });
   }
+  // [FIX] フィルタで channels が空になった animation は glTF 仕様違反(最低1 channel 必須)。
+  //       PowerPoint が読み込みを拒否し得るため除去する。
+  json.animations=json.animations.filter(a=>a.channels && a.channels.length>0);
+  if(json.animations.length===0) delete json.animations;
   console.log('[sanitizeGlb] removed scale-on-bone:',removedScale,', translation-on-non-hips:',removedTrans);
   // JSON チャンクを書き戻す(4byte 境界に空白パディング)。BIN チャンクはそのまま連結。
   const te=new TextEncoder();
@@ -70380,7 +70449,9 @@ async function processModelFile(file){
   const name=file.name.toLowerCase();
   let obj, animations=[];
   if(name.endsWith('.fbx')){
+    _fbxLoadStarted=false;
     obj=fbxLoader.parse(buf, '');
+    await waitFbxTextures();          // [FIX] 埋め込みテクスチャのデコード完了を待ってから export/poster へ
     animations=obj.animations||[];
   } else if(name.endsWith('.glb')||name.endsWith('.gltf')){
     const gltf=await new Promise((res,rej)=>gltfLoader.parse(buf,'',res,rej));
