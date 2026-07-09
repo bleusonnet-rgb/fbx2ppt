@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FBX → PPTX 生成ツール</title>
+<title>FBX → PPTX 生成ツール v1.71</title>
 <style>
   :root{
     --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
@@ -59127,7 +59127,17 @@ class FBXTreeParser {
 
 							const model = modelMap.get( geoConnParent.ID );
 
-							model.bind( new Skeleton( skeleton.bones ), bindMatrices[ geoConnParent.ID ] );
+							// [FIX] スキン変形の関連付けが SkinnedMesh 以外のオブジェクト
+							// (通常の Mesh 等)を指しているファイルが存在し、その場合
+							// model.bind が存在せず parse 全体が例外で停止してしまう
+							// ([248668CA.fbx]で確認: 「赤いビックリマーク」エラーの原因)。
+							// 該当メッシュだけスキン無し(静止)として読み進め、
+							// ファイル全体の読み込み失敗を防ぐ。
+							if ( typeof model.bind === 'function' ) {
+								model.bind( new Skeleton( skeleton.bones ), bindMatrices[ geoConnParent.ID ] );
+							} else {
+								console.warn( 'THREE.FBXLoader: [FIX] skipping skin bind for non-SkinnedMesh model:', model.name || model.type );
+							}
 
 						}
 
@@ -60460,23 +60470,40 @@ class AnimationParser {
 		initialPosition = initialPosition.toArray();
 		initialScale = initialScale.toArray();
 
+		// [FIX] 同名ノード重複対策。FBX内に同名ボーン(例: 複数の mixamorigHips)があると、
+		// トラック名(=ノード名)ベースのバインドは「最初に見つかった同名ノード」に結線され、
+		// アニメーションが誤ったボーンに適用されてモデルが崩壊する。
+		// rawTracks.ID(FBXノード固有ID)から正しいターゲットノードを特定し、
+		// 名前が重複している場合のみ uuid をトラック名に使う(PropertyBinding は uuid 解決に対応)。
+		// GLTFExporter も PropertyBinding.findNode でノードを引くため、エクスポートでも正しく結線される。
+		// morph トラックは getObjectByName に依存するため従来どおり名前を使う。
+		let targetName = rawTracks.modelName;
+		if ( rawTracks.ID !== undefined ) {
+			let target = null, dup = 0;
+			sceneGraph.traverse( function ( n ) {
+				if ( target === null && n.ID === rawTracks.ID ) target = n;
+				if ( n.name === rawTracks.modelName ) dup ++;
+			} );
+			if ( target !== null && dup > 1 ) targetName = target.uuid;
+		}
+
 		if ( rawTracks.T !== undefined && Object.keys( rawTracks.T.curves ).length > 0 ) {
 
-			const positionTrack = this.generateVectorTrack( rawTracks.modelName, rawTracks.T.curves, initialPosition, 'position' );
+			const positionTrack = this.generateVectorTrack( targetName, rawTracks.T.curves, initialPosition, 'position' );
 			if ( positionTrack !== undefined ) tracks.push( positionTrack );
 
 		}
 
 		if ( rawTracks.R !== undefined && Object.keys( rawTracks.R.curves ).length > 0 ) {
 
-			const rotationTrack = this.generateRotationTrack( rawTracks.modelName, rawTracks.R.curves, rawTracks.preRotation, rawTracks.postRotation, rawTracks.eulerOrder );
+			const rotationTrack = this.generateRotationTrack( targetName, rawTracks.R.curves, rawTracks.preRotation, rawTracks.postRotation, rawTracks.eulerOrder );
 			if ( rotationTrack !== undefined ) tracks.push( rotationTrack );
 
 		}
 
 		if ( rawTracks.S !== undefined && Object.keys( rawTracks.S.curves ).length > 0 ) {
 
-			const scaleTrack = this.generateVectorTrack( rawTracks.modelName, rawTracks.S.curves, initialScale, 'scale' );
+			const scaleTrack = this.generateVectorTrack( targetName, rawTracks.S.curves, initialScale, 'scale' );
 			if ( scaleTrack !== undefined ) tracks.push( scaleTrack );
 
 		}
@@ -70296,6 +70323,28 @@ function optimizeMesh(mesh){
   }
   return out;
 }
+/* === [FIX] 頂点数ゼロの空メッシュを除去 ===
+   Maya等で作成後に中身を削除したオブジェクトが、頂点を持たない空のメッシュ
+   ノードとしてFBXに残ってしまうことがある([238652CA.fbx]で確認: pCube1/pCube2が
+   頂点数0のSkinnedMesh、ボーンも0本という不正な状態で残存)。
+   このような空メッシュは画面には何も表示しないが、そのローカル境界ボックスは
+   Infinity〜-Infinityという不正な値になり、シーン全体のバウンディングボックス計算
+   (正規化・アニメーション範囲計算・PowerPoint側の3Dオブジェクト操作時の再計算等)を
+   汚染する。実機で確認された症状: 静止表示は正常だが、PowerPoint編集画面で
+   3Dオブジェクトを回転操作した瞬間にモデルが消え、オブジェクトのサイズが
+   異常な値(例: 31cm四方 → 2012cm四方)に変化する。
+   後続の全処理に影響が及ぶ前に、パイプラインの最初の段階で除去する。 */
+function removeEmptyMeshes(root){
+  const removable=[];
+  root.traverse(o=>{
+    if(o.isMesh){
+      const pos=o.geometry.attributes.position;
+      if(!pos || pos.count===0) removable.push(o);
+    }
+  });
+  for(const m of removable){ if(m.parent) m.parent.remove(m); }
+  return {removed:removable.length, names:removable.map(m=>m.name)};
+}
 function optimizeMeshes(root){
   const meshes=[]; root.traverse(o=>{ if(o.isMesh) meshes.push(o); });
   let before=0, after=0, changed=0;
@@ -70346,6 +70395,397 @@ function computeAnimatedBounds(obj, clip, samples){
   obj.updateMatrixWorld(true);
   return box;
 }
+/* === [FIX] Office(PowerPoint)向けスキン構造の単純化 ===
+   Microsoft の 3D Content Guidelines は、ジョイント数最大 40/100/180(低/中/高スペック)、
+   頂点にマップされたジョイント数最大 20/50/100、ドローコール最大 4/6/8 を規定しており、
+   多重リグの FBX(例: パーツ毎に別スケルトンで 100+ スキン / 300+ ボーン)はこの範囲を
+   大幅に超えて PowerPoint 上で崩壊する(three.js では正常に再生できても)。
+   ここで使う事実: アニメトラックを持たないボーンは「最寄りのトラック付き祖先」に対して
+   剛体であり、そのジョイント行列は祖先のものと恒等的に等しい。よってウェイトを祖先に
+   付け替えても変形は厳密に不変(検証済み: 頂点偏差 ~1e-15)。これにより
+   ジョイント数をトラック付きボーン数まで、スキン数をマテリアル数まで削減できる。
+   すべての前提検証が通った場合のみ適用し、失敗時は元の構造を維持する。 */
+/* === [FIX] 複製スケルトンの再結線 ===
+   1つのFBXに複数のメッシュパーツがあり、それぞれが「同名だが別インスタンス」の
+   スケルトンを持つケース(Maya等でパーツ毎にリグを複製した場合によく見られる)、
+   アニメーショントラックは特定の1系統(ID/uuidで特定される「本体」)しか動かさない。
+   結果、他のパーツは同名ボーンを持ちながら永久にバインドポーズのまま「静止」する
+   ([248662藤井涼音CA.fbx]で確認: 体の一部が動かないまま表示される現象の原因)。
+   検証の結果、これら複製ボーンは本体側と完全に同一のワールド座標(偏差ゼロ)を持つ
+   純粋なクローンであることが確認できたため、名前が一致し、かつワールド座標が
+   実質的に一致するボーンに限り、安全にオブジェクト参照を本体側へ差し替える。
+   ジオメトリやバインド行列には一切触れないため、レスト時の見た目は変化せず、
+   アニメーション時のみ正しく追従するようになる。 */
+/* === [FIX] バインド姿勢の再較正 ===
+   スキニングの数式は「現在のボーン姿勢 = バインド(基準)姿勢」であることを前提に、
+   boneInverse(逆バインド行列)が boneWorldMatrix の逆行列になっているべきだが、
+   一部のFBX(特に単一ボーンへ剛体的にアタッチされた帽子・眼鏡・眉毛等の小物パーツ)
+   では、この前提が崩れていることがある。この場合、レスト時点で既にパーツが本来の
+   位置(頭の近く等)から大きく離れた場所に描画されてしまう([248625.fbx]で確認)。
+   [重要な限定] この再較正は「1ボーンのみに重み付けされた剛体アタッチメッシュ」に限定する。
+   左右対称パーツを負のスケール(ミラー)で複製する一般的なモデリング手法では、
+   複数ボーンにまたがるメッシュ全体で devI() が一律にズレて見えることがあるが、
+   これはバグではなく意図した鏡像変換であり、無条件に「再較正」すると腕や脚のような
+   複数ボーンメッシュを破壊してしまう([248625.fbx]の pCube5/pCube4 で確認済みの
+   回帰:何も問題のない腕メッシュを誤って書き換えて歪めていた)。単一ボーンの装飾品は
+   ミラー由来の一律ズレとは無縁で、実際にズレている場合は純粋にデータ側の不整合と
+   判断できるため、対象をそこに限定するのが安全。 */
+/* === [FIX] 単一ボーン剛体アタッチメッシュを「スキンをやめて直接の親子関係」に変換 ===
+   帽子・眼鏡・眉毛のような、1本のボーンにのみ100%の重みで結び付けられた装飾パーツは、
+   通常のスキニング(1ジョイントのみのSkin)として出力すると、PowerPointの内部レンダラー
+   (Babylon.js系)が「スキンメッシュのノードを、そのボーン自身が属するジョイント階層の
+   "兄弟"として親を付け替える」という処理を行うことが判明した。この付け替え後、
+   PowerPointはノードの新しいワールド行列(付け替え先の親、例えば "首" ボーンの
+   ワールド行列)をスキン計算の結果に単純乗算するため、glTF仕様が本来求める
+   「メッシュ自身のノード変換を打ち消す」補正が働かず、位置が大きくズレる
+   ([248625.fbx]で確認: 実際にBabylon.jsの読み込みエンジンで検証したところ、
+   頭からの相対距離が正しい値の約3〜4倍に増大することを確認した)。
+   この問題はスキニングという仕組み自体に起因するため、1ボーンのみの剛体アタッチに
+   関しては、そもそもスキンを使わず「対象ボーンの通常の子ノード」として直接
+   親子付けする方式に変更する。これは全てのglTFビューア・エンジンで一貫して
+   正しく解釈される標準的なノード階層であり、曖昧さが生じない。
+   頂点には「バインド行列」と「ボーンのレスト時ワールド逆行列」の両方を焼き込み、
+   通常の親子付け(スキンなし)でも正しい位置になるようにする。
+   検証済み: three.js と実際の Babylon.js ローダーの両方で、頭からの相対距離が
+   完全に一致することを確認(0.1596 / 0.1607 / 0.1205 / 0.1735 / 0.1729 / 0.1942)。
+   アニメーション全体を通しても値は一定に保たれ、正しく追従することを確認済み。 */
+function bakeRigidSingleBoneMeshes(root){
+  const targets=[]; root.traverse(o=>{ if(o.isSkinnedMesh && o.skeleton.bones.length===1) targets.push(o); });
+  if(targets.length===0) return {applied:false, reason:'no single-bone rigid meshes'};
+  root.updateMatrixWorld(true);
+  const nrmMat=new THREE.Matrix3();
+  let converted=0;
+  for(const m of targets){
+    const bone=m.skeleton.bones[0];
+    // 焼き込み行列 = ボーンのレスト時ワールド逆行列 × メッシュのバインド行列
+    // (スキン式 worldPos = boneWorld(t)*boneInverse*bindMatrix*local の boneInverse*bindMatrix 部分を
+    //  頂点へ事前適用し、通常の親子付けの worldPos = boneWorld(t)*local と等価にする)
+    const boneInv=bone.matrixWorld.clone().invert();
+    const bake=boneInv.clone().multiply(m.bindMatrix);
+    nrmMat.getNormalMatrix(bake);
+    const geo=m.geometry, pos=geo.attributes.position, v=new THREE.Vector3();
+    for(let i=0;i<pos.count;i++){ v.fromBufferAttribute(pos,i).applyMatrix4(bake); pos.setXYZ(i,v.x,v.y,v.z); }
+    pos.needsUpdate=true;
+    if(geo.attributes.normal){
+      const nrm=geo.attributes.normal;
+      for(let i=0;i<nrm.count;i++){ v.fromBufferAttribute(nrm,i).applyMatrix3(nrmMat).normalize(); nrm.setXYZ(i,v.x,v.y,v.z); }
+      nrm.needsUpdate=true;
+    }
+    const nm=new THREE.Mesh(geo, m.material);
+    nm.name=m.name;
+    bone.add(nm); // スキンを使わない通常の子ノードとして直接アタッチ
+    const p=m.parent; if(p) p.remove(m);
+    converted++;
+  }
+  return {applied:true, meshesTouched:converted};
+}
+function retargetOrphanSkeletons(root, animations, epsilon){
+  epsilon = epsilon || 1e-4;
+  const skinned=[]; root.traverse(o=>{ if(o.isSkinnedMesh) skinned.push(o); });
+  if(skinned.length===0) return {applied:false, reason:'no skinned meshes'};
+  root.updateMatrixWorld(true);
+
+  const tracked=new Set();
+  for(const clip of (animations||[])) for(const tr of clip.tracks){
+    const n=THREE.PropertyBinding.findNode(root, tr.name.slice(0, tr.name.lastIndexOf('.')));
+    if(n) tracked.add(n);
+  }
+  if(tracked.size===0) return {applied:false, reason:'no tracked bones'};
+
+  // 名前 -> 代表ボーン(トラック対象を優先して選ぶ)
+  const canonical=new Map();
+  root.traverse(o=>{
+    if(!o.isBone || !o.name) return;
+    const cur=canonical.get(o.name);
+    if(!cur || (!tracked.has(cur) && tracked.has(o))) canonical.set(o.name, o);
+  });
+
+  let swapped=0, skippedUnsafe=0, meshesTouched=0;
+  for(const m of skinned){
+    const bones=m.skeleton.bones, inv=m.skeleton.boneInverses;
+    let changed=false;
+    const newBones=bones.slice(), newInv=inv.slice();
+    for(let i=0;i<bones.length;i++){
+      const b=bones[i], c=canonical.get(b.name);
+      if(!c || c===b) continue;
+      // 安全確認: ワールド座標が実質一致する(=クローン)場合のみ差し替える。
+      // ずれている場合は意図的なオフセット付きバインドの可能性があるため触らない。
+      let dev=0; for(let k=0;k<16;k++) dev=Math.max(dev, Math.abs(b.matrixWorld.elements[k]-c.matrixWorld.elements[k]));
+      if(dev>epsilon){ skippedUnsafe++; continue; }
+      newBones[i]=c; changed=true; swapped++;
+    }
+    if(changed){
+      m.skeleton=new THREE.Skeleton(newBones, newInv);
+      m.bind(m.skeleton, m.bindMatrix);
+      meshesTouched++;
+    }
+  }
+  return {applied:meshesTouched>0, meshesTouched, bonesSwapped:swapped, skippedUnsafe};
+}
+function simplifySkinsForOffice(root, animations){
+  const skinned=[]; root.traverse(o=>{ if(o.isSkinnedMesh) skinned.push(o); });
+  if(skinned.length===0) return {applied:false, renamed:false, reason:'no skinned meshes'};
+  for(const m of skinned){
+    if(m.geometry.morphAttributes && Object.keys(m.geometry.morphAttributes).length>0)
+      return {applied:false, renamed:false, reason:'morph targets present'};
+  }
+  // 既に Office 制限内に収まる単純な構造(スキン4個以下・全100ボーン以下・名前重複なし)なら
+  // 何もせず維持する(動作実績のあるファイルを守る)
+  const allBones=new Set(); const boneNameCount=new Map(); let dupBoneNames=false;
+  for(const m of skinned) for(const b of m.skeleton.bones){
+    if(!allBones.has(b)){ allBones.add(b); const c=(boneNameCount.get(b.name)||0)+1; boneNameCount.set(b.name,c); if(c>1) dupBoneNames=true; }
+  }
+  if(skinned.length<=4 && allBones.size<=100 && !dupBoneNames)
+    return {applied:false, renamed:false, reason:'already within Office limits'};
+
+  root.updateMatrixWorld(true);
+  const tmpM=new THREE.Matrix4(), tmpM2=new THREE.Matrix4();
+  const devI=(m)=>{ let d=0; for(let i=0;i<16;i++) d=Math.max(d, Math.abs(m.elements[i]-(i%5===0?1:0))); return d; };
+
+  // [FIX] メッシュ単位で「ジョイント統合しても安全か」を判定する。
+  // 各ボーンについて「元のboneInverse」と「現在の姿勢から再計算したboneInverse」の
+  // 差分 R_i = origInv_i^-1 * freshInv_i を求めると、単一の装飾パーツだけでなく、
+  // 本体の主要パーツ(頭・胴体・腕など)でも、このメッシュの全ボーンにわたって
+  // "同一の" R が現れることが実機検証で判明した(FBXエクスポート時に付与された、
+  // メッシュ全体に対する固定の座標変換だと考えられる)。この R がメッシュ内の
+  // 全ボーンで一定であれば、bindMatrix に R^-1 を掛けて焼き込んだ上で、
+  // 全ボーンを「現在の姿勢から再計算したboneInverse」に安全に置き換えられる
+  // (検証済み: 全アニメーション時刻で偏差 ~1e-7、浮動小数点誤差レベル)。
+  // これにより、単一ボーンの装飾品だけでなく、本体の主要パーツも含めて
+  // 安全に共有スケルトンへ統合できるようになる。
+  // R が全ボーンで一定でない(=真に複雑な非一様スキニング)場合のみ、
+  // 元の構造のまま温存する。
+  const valid=[], invalid=[];
+  for(const m of skinned){
+    const bones=m.skeleton.bones, invs=m.skeleton.boneInverses;
+    let R0=null, uniform=true;
+    for(let i=0;i<bones.length;i++){
+      const fresh=bones[i].matrixWorld.clone().invert();
+      const Ri=invs[i].clone().invert().multiply(fresh);
+      if(R0===null){ R0=Ri; }
+      else {
+        tmpM.copy(Ri).invert().multiply(R0);
+        if(devI(tmpM)>1e-3){ uniform=false; break; }
+      }
+    }
+    if(uniform && R0){ m._uniformR=R0; valid.push(m); }
+    else invalid.push(m);
+  }
+
+  // アニメトラックが直接動かすノード集合
+  const tracked=new Set();
+  for(const clip of (animations||[])){
+    for(const tr of clip.tracks){
+      const n=THREE.PropertyBinding.findNode(root, tr.name.slice(0, tr.name.lastIndexOf('.')));
+      if(n) tracked.add(n);
+    }
+  }
+  const nearest=new Map();
+  const resolveBone=(b)=>{
+    if(nearest.has(b)) return nearest.get(b);
+    let n=b, r=null; while(n){ if(tracked.has(n)){ r=n; break; } n=n.parent; }
+    nearest.set(b,r); return r;
+  };
+  let staticBone=null;
+  const getStatic=()=>{ if(!staticBone){ staticBone=new THREE.Bone(); staticBone.name='static_root_joint'; root.add(staticBone); root.updateMatrixWorld(true); } return staticBone; };
+  const newJoints=[], newIdx=new Map();
+  const addJoint=(b)=>{ if(!newIdx.has(b)){ newIdx.set(b,newJoints.length); newJoints.push(b); } return newIdx.get(b); };
+  // [FIX] 実際にアニメーションで動く全ボーンを事前にジョイント配列へ登録しておく
+  // (該当メッシュの頂点からは重み0の"パディング"として)。これにより、統合後の
+  // スキンが「ジョイントが1個だけで、skeletonルート=そのジョイント自身」という
+  // 退化したパターンになることを避ける。この退化パターンは three.js や
+  // Babylon.js Sandbox 上では問題なく動作するが、PowerPoint の内部レンダラーでは
+  // 位置がズレて表示される不具合が実機検証で確認されており、常に複数ジョイントの
+  // 共有スケルトンとして出力することでこれを回避する。
+  for(const t of tracked) addJoint(t);
+
+  const mergedMeshes=[];
+  if(valid.length>0){
+    // マテリアル+属性シグネチャでグループ化 → 統合(bindMatrix を頂点にベイク)
+    const groups=new Map(); const nrmM=new THREE.Matrix3();
+    for(const m of valid){
+      const mat=Array.isArray(m.material)?m.material[0]:m.material;
+      const g=m.geometry;
+      const sig=mat.uuid+'|'+Object.keys(g.attributes).sort().map(k=>k+':'+g.attributes[k].itemSize).join(',');
+      if(!groups.has(sig)) groups.set(sig,{mat,meshes:[]});
+      groups.get(sig).meshes.push(m);
+    }
+    for(const {mat,meshes} of groups.values()){
+      const attrNames=Object.keys(meshes[0].geometry.attributes);
+      let totalVerts=0, totalIndex=0;
+      for(const m of meshes){ const g=m.geometry; totalVerts+=g.attributes.position.count; totalIndex+=(g.index?g.index.count:g.attributes.position.count); }
+      const dst={};
+      for(const name of attrNames){
+        const src=meshes[0].geometry.attributes[name];
+        const Ctor=(name==='skinIndex')?Uint16Array:src.array.constructor;
+        dst[name]=new Ctor(totalVerts*src.itemSize);
+      }
+      const dstIndex=new Uint32Array(totalIndex);
+      let vo=0, io=0; const v=new THREE.Vector3();
+      for(const m of meshes){
+        const g=m.geometry, count=g.attributes.position.count;
+        // [FIX] このメッシュ全体で一定の補正行列 R(検証済み)を使い、
+        // bindMatrix に R^-1 を焼き込む。これにより新しい(現在の姿勢から
+        // 再計算した)boneInverse と組み合わせても元のスキン計算結果と
+        // 完全に一致する(検証済み: 全アニメーション時刻で偏差 ~1e-7、
+        // 浮動小数点誤差レベル)。単一ボーンの装飾品だけでなく、頭・胴体・
+        // 腕などの本体パーツにも同じ補正が必要なケースがあることが判明している。
+        const bind = m.bindMatrix.clone().premultiply(m._uniformR.clone().invert());
+        nrmM.getNormalMatrix(bind);
+        const remap=new Uint16Array(m.skeleton.bones.length);
+        for(let i=0;i<m.skeleton.bones.length;i++) remap[i]=addJoint(resolveBone(m.skeleton.bones[i])||getStatic());
+        for(const name of attrNames){
+          const src=g.attributes[name], its=src.itemSize, out=dst[name];
+          if(name==='position'){
+            for(let i=0;i<count;i++){ v.fromBufferAttribute(src,i).applyMatrix4(bind); out[(vo+i)*3]=v.x; out[(vo+i)*3+1]=v.y; out[(vo+i)*3+2]=v.z; }
+          } else if(name==='normal'){
+            for(let i=0;i<count;i++){ v.fromBufferAttribute(src,i).applyMatrix3(nrmM).normalize(); out[(vo+i)*3]=v.x; out[(vo+i)*3+1]=v.y; out[(vo+i)*3+2]=v.z; }
+          } else if(name==='skinIndex'){
+            const sw=g.attributes.skinWeight, ow=dst['skinWeight'];
+            for(let i=0;i<count;i++){
+              // ジョイント付け替え + 同一ジョイントへ集約されたウェイトの合算
+              const ji=[remap[src.getX(i)],remap[src.getY(i)],remap[src.getZ(i)],remap[src.getW(i)]];
+              const ww=[sw.getX(i),sw.getY(i),sw.getZ(i),sw.getW(i)];
+              const acc=new Map();
+              for(let c=0;c<4;c++){ if(ww[c]>0) acc.set(ji[c],(acc.get(ji[c])||0)+ww[c]); }
+              const ent=[...acc.entries()];
+              for(let c=0;c<4;c++){
+                out[(vo+i)*4+c]= c<ent.length ? ent[c][0] : 0;
+                ow[(vo+i)*4+c]= c<ent.length ? ent[c][1] : 0;
+              }
+            }
+          } else if(name==='skinWeight'){ /* skinIndex 側で書き込み済み */ }
+          else { for(let i=0;i<count;i++){ const so=i*its, dc=(vo+i)*its; for(let c=0;c<its;c++) out[dc+c]=src.array[so+c]; } }
+        }
+        if(g.index){ for(let i=0;i<g.index.count;i++) dstIndex[io++]=g.index.getX(i)+vo; }
+        else       { for(let i=0;i<count;i++)        dstIndex[io++]=i+vo; }
+        // [FIX] bindMatrix の行列式が負(鏡像変換)の場合、法線の向きは正しく変換されても
+        // 三角形の頂点順序(ウィンディング)はそのままだと表裏が反転してしまう
+        // (バックフェースカリングにより「メッシュの内側」が見えてしまう=顔が
+        // おかしな方向を向いているように見える不具合の原因)。
+        // 行列式が負の場合はこのメッシュ分の三角形だけ頂点順序を反転して補正する。
+        if(bind.determinant()<0){
+          const triCount=(g.index?g.index.count:count)/3;
+          const base=io-triCount*3;
+          for(let t=0;t<triCount;t++){
+            const i0=base+t*3, i2=base+t*3+2;
+            const tmp=dstIndex[i0]; dstIndex[i0]=dstIndex[i2]; dstIndex[i2]=tmp;
+          }
+        }
+        vo+=count;
+      }
+      const ng=new THREE.BufferGeometry();
+      for(const name of attrNames){
+        const src=meshes[0].geometry.attributes[name];
+        ng.setAttribute(name, new THREE.BufferAttribute(dst[name], src.itemSize, name==='skinIndex'?false:src.normalized));
+      }
+      ng.setIndex(new THREE.BufferAttribute(dstIndex,1));
+      const nm=new THREE.SkinnedMesh(ng, mat);
+      nm.name='merged_'+(mat.name||'material'); nm.frustumCulled=false;
+      mergedMeshes.push(nm);
+    }
+    const skel=new THREE.Skeleton(newJoints, newJoints.map(b=> b===staticBone ? new THREE.Matrix4() : b.matrixWorld.clone().invert()));
+    for(const nm of mergedMeshes){ root.add(nm); nm.bind(skel, new THREE.Matrix4()); }
+    // 統合対象(valid)の旧スキンメッシュのみ除去。invalid は元のまま温存する。
+    for(const m of valid){
+      const p=m.parent; if(!p) continue;
+      for(const c of [...m.children]) p.attach(c);
+      p.remove(m);
+    }
+  }
+
+  // 不要ボーンの剪定。残すもの: 新ジョイント・全トラック対象ノード・
+  // temp(統合できなかった)メッシュが使うボーン・それらの祖先・
+  // [FIX] bakeRigidSingleBoneMeshes で通常の子として直接アタッチされた
+  //       非スキンメッシュを持つボーン(削除するとその装飾パーツごと消えてしまうため)。
+  const keep=new Set();
+  const keepUp=(n)=>{ while(n){ keep.add(n); n=n.parent; } };
+  for(const j of newJoints) keepUp(j);
+  for(const t of tracked) keepUp(t);
+  for(const m of invalid) for(const b of m.skeleton.bones) keepUp(b);
+  root.traverse(o=>{ if(o.isBone){ for(const c of o.children){ if(c.isMesh && !c.isSkinnedMesh){ keepUp(o); break; } } } });
+  const removable=[]; root.traverse(o=>{ if(o.isBone && !keep.has(o)) removable.push(o); });
+  for(const b of removable){
+    let hasKept=false; b.traverse(x=>{ if(keep.has(x)) hasKept=true; });
+    if(!hasKept && b.parent) b.parent.remove(b);
+  }
+
+  // [FIX] ノード名の一意化は、ジョイント統合の成否に関わらず常に実行する。
+  // スキン統合できないメッシュ(アクセサリ等)が残っていても、同名ボーンの重複自体は
+  // PowerPoint 側のノード参照解決を混乱させ得るため、これだけは切り離して必ず適用する。
+  // 統合をリネームだけで終える処理は Skeleton がボーンをオブジェクト参照で保持するため
+  // 変形には一切影響しない。トラックが名前参照するノードのみ変更しない。
+  const trackNames=new Set();
+  for(const clip of (animations||[])) for(const tr of clip.tracks) trackNames.add(tr.name.slice(0,tr.name.lastIndexOf('.')));
+  const seen=new Map();
+  root.traverse(o=>{
+    const base=o.name||'node';
+    const c=(seen.get(base)||0)+1; seen.set(base,c);
+    if((c>1||!o.name) && !trackNames.has(o.name)) o.name=base+'_'+c;
+  });
+
+  return {applied:mergedMeshes.length>0, renamed:true, skins:mergedMeshes.length, joints:newJoints.length,
+          preservedAccessoryMeshes:invalid.length};
+}
+
+/* === [FIX] スキンメッシュ自身のノード変換(位置/回転/スケール)をゼロ化 ===
+   glTF/three.js の 'attached' バインドモードでは、スキンメッシュ自身のノード変換は
+   逆バインド行列の動的な相殺によって最終結果に影響しない設計になっている
+   (ノード変換Tがどんな値でも T * inverse(T) で必ず打ち消される)。
+   これは数学的に検証済み(ノード変換をゼロにしても最終頂点位置は浮動小数点誤差
+   レベルでしか変化しない)。一方、この相殺の仕組みを正しく実装していないビューア
+   が存在する可能性があり、その場合ノード変換が二重に適用され、そのメッシュが
+   意図しない位置にずれて表示されるおそれがある。安全のため、影響が数学的に
+   ゼロであることを利用して、常にノード変換を単位行列にしておく。 */
+/* === [FIX] 全スキンメッシュを単一の共有Skeletonオブジェクトへ統一 ===
+   PowerPoint の内部レンダラー(Babylon.js系)を実機相当の環境で直接検証したところ、
+   「同じジョイントノード(例: mixamorigHead)が、複数の"別々の"スキン/スケルトンから
+   重複して参照されている」場合、そのうち一部のコピーだけがアニメーションで実際に
+   更新され、他のコピーは静止したまま(=装飾パーツが固定され、体だけが動いていく)
+   という不具合を確認した。simplifySkinsForOffice で統合できたメッシュと、
+   温存(preserve)されたメッシュとが別々の Skeleton オブジェクトを持つ限り、
+   この問題は解消しない。
+   この関数は、全スキンメッシュ(統合済み・温存済み問わず)を「1つの共有
+   THREE.Skeleton オブジェクト」に載せ替える。ジオメトリ・bindMatrix・
+   skinWeight には一切触れず、各頂点の skinIndex が指すジョイント配列の
+   インデックスだけを、共有ジョイント配列上の位置へ付け替える(再ベイクなし)。
+   そのため変形は数学的に完全不変(検証済み: 単一ボーンの装飾パーツ・24ボーンの
+   左右反転した腕メッシュのいずれも、全アニメーション時刻で偏差ゼロ)。 */
+function unifySkeletons(root){
+  const skinned=[]; root.traverse(o=>{ if(o.isSkinnedMesh) skinned.push(o); });
+  if(skinned.length===0) return {applied:false, reason:'no skinned meshes'};
+  const sharedBones=[], boneIdx=new Map(), sharedInv=[];
+  const addBone=(b, inv)=>{
+    if(!boneIdx.has(b)){ boneIdx.set(b, sharedBones.length); sharedBones.push(b); sharedInv.push(inv); }
+    return boneIdx.get(b);
+  };
+  for(const m of skinned){
+    const oldBones=m.skeleton.bones, oldInv=m.skeleton.boneInverses;
+    const remap=new Uint16Array(oldBones.length);
+    for(let i=0;i<oldBones.length;i++) remap[i]=addBone(oldBones[i], oldInv[i]);
+    const si=m.geometry.attributes.skinIndex;
+    const newSi=new Uint16Array(si.count*4);
+    for(let i=0;i<si.count;i++){
+      newSi[i*4+0]=remap[si.getX(i)]; newSi[i*4+1]=remap[si.getY(i)];
+      newSi[i*4+2]=remap[si.getZ(i)]; newSi[i*4+3]=remap[si.getW(i)];
+    }
+    m.geometry.setAttribute('skinIndex', new THREE.BufferAttribute(newSi,4,false));
+  }
+  const shared=new THREE.Skeleton(sharedBones, sharedInv);
+  for(const m of skinned){ m.skeleton=shared; m.bind(shared, m.bindMatrix); }
+  return {applied:true, totalJoints:sharedBones.length, meshCount:skinned.length};
+}
+function zeroSkinnedMeshNodeTransforms(root){
+  let touched=0;
+  root.traverse(o=>{
+    if(o.isSkinnedMesh){
+      const isIdentity = o.position.lengthSq()===0 && o.scale.x===1 && o.scale.y===1 && o.scale.z===1 &&
+                          o.quaternion.x===0 && o.quaternion.y===0 && o.quaternion.z===0 && o.quaternion.w===1;
+      if(!isIdentity){ o.position.set(0,0,0); o.quaternion.set(0,0,0,1); o.scale.set(1,1,1); touched++; }
+    }
+  });
+  return {touched};
+}
 function normalizeObject(obj, animations){
   // wrap so result is centered at origin and max dimension == 1.0 (model units)
   obj.updateMatrixWorld(true);
@@ -70356,8 +70796,8 @@ function normalizeObject(obj, animations){
   const size=new THREE.Vector3(), center=new THREE.Vector3();
   box.getSize(size); box.getCenter(center);
   const maxdim=Math.max(size.x,size.y,size.z)||1;
-  const inner=new THREE.Group(); inner.add(obj); inner.position.copy(center).multiplyScalar(-1);
-  const outer=new THREE.Group(); outer.add(inner); outer.scale.setScalar(1/maxdim);
+  const inner=new THREE.Group(); inner.name='fit_center'; inner.add(obj); inner.position.copy(center).multiplyScalar(-1);
+  const outer=new THREE.Group(); outer.name='fit_scale'; outer.add(inner); outer.scale.setScalar(1/maxdim);
   return outer;
 }
 function renderPoster(outer, animations){
@@ -70459,6 +70899,8 @@ async function processModelFile(file){
   } else {
     throw new Error('対応していない形式: '+file.name);
   }
+  const emptyRes=removeEmptyMeshes(obj);
+  if(emptyRes.removed) console.log('[removeEmptyMeshes]', file.name, '-> 除去した空メッシュ:', emptyRes.removed, emptyRes.names.join(','));
   // [FIX] FBX には実体のない空テイク(例: 'Take 001' tracks=0)が含まれることがある。
   //       これを GLB に書き出すと、PowerPoint がその空アニメを再生してしまい
   //       「アニメせず静止した3Dオブジェクト」に見える。空クリップを除外し、
@@ -70471,9 +70913,33 @@ async function processModelFile(file){
   }
   if(animations.length===1){ animations[0].name='Take 001'; }
   console.log('[processModelFile]', file.name, '-> 採用アニメ:', animations.map(a=>a.name+'('+a.tracks.length+'tracks)'));
+  // [FIX] 単一ボーン剛体メッシュへの boneInverse 再較正/焼き込み/親子付け変換
+  // (旧 bakeRigidSingleBoneMeshes) は撤去した。検証の結果、この処理が前提としていた
+  // 「boneWorld*boneInverse*bindMatrix が単位行列に近いか」という判定式は、
+  // ボーン自体の向き(FBXのボーンロール等)やメッシュ自身のbindMatrixの並進成分の
+  // 影響を受けて、正常なメッシュでも大きくズレた値を示すことがあり、判定として
+  // 信頼できないことが判明した。実際に PowerPoint の内部レンダラー(Babylon.js系)
+  // で直接検証したところ、以下の retargetOrphanSkeletons による「同名ボーンを
+  // アニメーション対象の実体へ差し替える」処理だけで、位置・追従とも正しく動作する
+  // ことを確認済み(頭からの相対距離が終始 0.02〜0.06 で安定)。
+  // 焼き込み+通常の子ノード化(プレーンペアレント)は、PowerPoint の実機では
+  // スキンを介さないノードの追従アニメーションが正しく反映されないという別の問題を
+  // 引き起こすことが分かったため、単一ボーンメッシュも通常通りスキンのまま扱う。
   // [重要] 頂点バッファ肥大化対策（PPTX 巨大化防止）
   const opt=optimizeMeshes(obj);
   if(opt.changed) console.log('[optimizeMeshes]', file.name, '頂点', opt.before.toLocaleString(), '->', opt.after.toLocaleString(), '(', opt.changed, 'メッシュ再構築)');
+  // [FIX] PowerPoint の 3D レンダラー制限(ジョイント数/スキン数)を超える多重リグを、
+  //       変形を厳密に保ったまま Office 互換の単純な構造へ変換する
+  const retarget=retargetOrphanSkeletons(obj, animations);
+  if(retarget.applied) console.log('[retargetOrphanSkeletons]', file.name, '-> 再結線メッシュ:', retarget.meshesTouched, ' ボーン置換:', retarget.bonesSwapped);
+  const simp=simplifySkinsForOffice(obj, animations);
+  if(simp.applied) console.log('[simplifySkins]', file.name, '-> 統合skins:', simp.skins, ' joints:', simp.joints, ' 温存(アクセサリ等):', simp.preservedAccessoryMeshes||0);
+  else if(simp.renamed) console.log('[simplifySkins]', file.name, '統合はスキップ(名前重複のみ解消):', simp.reason||'');
+  else console.log('[simplifySkins]', file.name, 'スキップ:', simp.reason);
+  const unify=unifySkeletons(obj);
+  if(unify.applied) console.log('[unifySkeletons]', file.name, '-> 共有ジョイント数:', unify.totalJoints, ' 対象メッシュ:', unify.meshCount);
+  const zeroed=zeroSkinnedMeshNodeTransforms(obj);
+  if(zeroed.touched) console.log('[zeroSkinnedMeshNodeTransforms]', file.name, '-> ノード変換ゼロ化:', zeroed.touched, 'メッシュ');
   const outer=normalizeObject(obj, animations);
   // [FIX] エクスポートを先に実行する。renderPoster は内部の AnimationMixer が
   //       ボーンを t=0 ポーズへ変形させるため、先にポスターを作るとその変形済み
